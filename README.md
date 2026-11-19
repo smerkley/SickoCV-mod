@@ -905,6 +905,8 @@ sickoLooper is inspired by hardware looper devices with most of their features i
 ![sickolooper1x3](https://github.com/sickozell/SickoCV/assets/80784296/3a6d28ae-1882-46a7-ba56-772fdc679d40)  
 ![sickolooper5](https://github.com/sickozell/SickoCV/assets/80784296/d7b2110a-4ffd-4171-96c2-b724a360875e)
 
+In this fork, sickoLooper3 supports the GrooveBox pad over MIDI. [Connection, pad layout and MIDI reference](docs/GrooveBox.md)
+
 #### - MANUALS
 Due to the complexity of these modules, a PDF user manual has been written
 

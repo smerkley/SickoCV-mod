@@ -55,6 +55,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include "SickoLooper3GrooveBox.hpp"
+
 using namespace std;
 
 struct tpSignatureSl3 : ParamQuantity {
@@ -429,6 +431,10 @@ struct SickoLooper3 : Module {
 	// ***************************************************************************************************
 	// ***************************************************************************************************
 
+#ifndef METAMODULE
+	looper3::GrooveBox<SickoLooper3> groovebox;
+#endif
+
 	SickoLooper3() {
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 
@@ -554,6 +560,9 @@ struct SickoLooper3 : Module {
 
 	json_t *dataToJson() override {
 		json_t *rootJ = json_object();
+#ifndef METAMODULE
+		groovebox.save(rootJ);
+#endif
 		json_object_set_new(rootJ, "SrcToMaster", json_boolean(srcToMaster));
 		json_object_set_new(rootJ, "OnlyClickOnEar", json_boolean(onlyClickOnEar));
 		json_object_set_new(rootJ, "EolPulseOnStop", json_boolean(eolPulseOnStop));
@@ -577,6 +586,9 @@ struct SickoLooper3 : Module {
 	}
 
 	void dataFromJson(json_t *rootJ) override {
+#ifndef METAMODULE
+		groovebox.load(rootJ);
+#endif
 
 		json_t* srcToMasterJ = json_object_get(rootJ, "SrcToMaster");
 		if (srcToMasterJ)
@@ -689,9 +701,8 @@ struct SickoLooper3 : Module {
 		recordedTracks = 0;
 		for (int track = 0; track < MAX_TRACKS; track++) {
 			extraSamples[track] = true;
-			playTail[track] = false;
+			stopTrackTails(track);
 			playFullTail[track] = false;
-			fadeTail[track] = false;
 			fadeInOnPlay[track] = false;
 			trackBuffer[track][LEFT].clear();
 			trackBuffer[track][RIGHT].clear();
@@ -1137,6 +1148,7 @@ struct SickoLooper3 : Module {
 		if (pSampleData != NULL && tsc > minSamplesToLoad * c) {
 
 			// stop track
+			stopTrackTails(track);
 			if ((trackStatus[track] != IDLE && trackStatus[track] != EMPTY) || nextStatus[track] != NOTHING)
 				busyTracks--;
 			if (track == nextSoloTrack)
@@ -2154,6 +2166,19 @@ struct SickoLooper3 : Module {
 			xFadeDelta[track] = 1 / minTimeSamples;
 	}
 
+	// Idle tracks may still read a crossfade or record up to a second of tail.
+	// End these operations before releasing or replacing their sample buffers.
+	void stopTrackTails(int track) {
+		extraRecording[track] = false;
+		extraPlaying[track] = false;
+		extraPlayingFadeOut[track] = false;
+		playTail[track] = false;
+		fadeTail[track] = false;
+		fadeIn[track] = false;
+		recFade[track] = false;
+		recFadeValue[track] = 1.f;
+	}
+
 	bool isExtraSamples(int track) {
 		return extraSamples[track];
 	}
@@ -2208,6 +2233,8 @@ struct SickoLooper3 : Module {
 	}
 
 	void inline cancelNextStatus(int track) {
+		if (track < 0 || track >= MAX_TRACKS)
+			return; // A queued solo can be cancelled before any solo track is active.
 		if (trackStatus[track] == PLAYING)
 			setPlayLed(track);
 		else if (trackStatus[track] == RECORDING)
@@ -2225,6 +2252,34 @@ struct SickoLooper3 : Module {
 		nextStatus[track] = NOTHING;
 	}
 
+	void stopAllTracks() {
+		nextSoloTrack = -1;
+		for (int track = 0; track < MAX_TRACKS; ++track) {
+			switch (trackStatus[track]) {
+				case EMPTY:
+				case IDLE:
+					if (nextStatus[track] != NOTHING) {
+						resetIdleEmptyStatus(track);
+						--busyTracks;
+					}
+					continue;
+				case PLAYING:
+					setFastPlayLed(track);
+					stopNow[track] = stopImm_setting[track];
+					break;
+				case RECORDING:
+					setFastRecLed(track);
+					stopNow[track] = !loopSync_setting[track];
+					break;
+				case OVERDUBBING:
+					setFastOverdubLed(track);
+					stopNow[track] = stopImm_setting[track];
+					break;
+			}
+			nextStatus[track] = IDLE;
+		}
+	}
+
 /*
 																				██████╗░██████╗░░█████╗░░█████╗░███████╗░██████╗░██████╗
 																				██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝██╔════╝
@@ -2234,6 +2289,11 @@ struct SickoLooper3 : Module {
 																				╚═╝░░░░░╚═╝░░╚═╝░╚════╝░░╚════╝░╚══════╝╚═════╝░╚═════╝░
 */
 	void process(const ProcessArgs &args) override {
+#ifndef METAMODULE
+		const int padButton = groovebox.process(*this, args);
+#else
+		constexpr int padButton = looper3::NO_BUTTON;
+#endif
 
 		barReached = false;
 
@@ -2360,7 +2420,7 @@ struct SickoLooper3 : Module {
 			allSSTrig = 0;
 		}
 
-		allSSTrig += params[ALLSTARTSTOP_BUT_PARAM].getValue();
+		allSSTrig += (params[ALLSTARTSTOP_BUT_PARAM].getValue() || padButton == ALLSTARTSTOP_BUT_PARAM);
 		if (allSSTrig >= 1 && prevAllSSTrig == 0) {
 			if (globalStatus == IDLE && recordedTracks > 0) {
 				for (int track = 0; track < MAX_TRACKS; track++) {
@@ -2386,39 +2446,14 @@ struct SickoLooper3 : Module {
 
 				runSetting = 1; // this starts clock
 
-			} else if (globalStatus == PLAYING) {
-				for (int track = 0; track < MAX_TRACKS; track++) {
-					switch (trackStatus[track]) {
-						case EMPTY:
-						case IDLE:
-						break;
-
-						case PLAYING:
-							setFastPlayLed(track);
-							if (stopImm_setting[track])
-								stopNow[track] = true;
-						break;
-
-						case RECORDING:
-							setFastRecLed(track);
-							if (!loopSync_setting[track])
-								stopNow[track] = true;
-						break;
-
-						case OVERDUBBING:
-							setFastOverdubLed(track);
-							if (stopImm_setting[track])
-								stopNow[track] = true;
-						break;
-					}
-					nextStatus[track] = IDLE;
-				}
+			} else if (globalStatus != IDLE) {
+				stopAllTracks();
 			}
 			
 		}
 		prevAllSSTrig = allSSTrig;
 
-		allStopTrig = inputs[ALLSTOP_TRIG_INPUT].getVoltage();
+		allStopTrig = padButton == looper3::ALL_STOP ? 10.f : inputs[ALLSTOP_TRIG_INPUT].getVoltage();
 		if (allStopTrig > 1.f && prevAllStopTrig <= 1.f) {
 			allStop = true;
 		} else {
@@ -2426,34 +2461,8 @@ struct SickoLooper3 : Module {
 		}
 		prevAllStopTrig = allStopTrig;
 
-		if (allStop && globalStatus == PLAYING) {
-			for (int track = 0; track < MAX_TRACKS; track++) {
-				switch (trackStatus[track]) {
-					case EMPTY:
-					case IDLE:
-					break;
-
-					case PLAYING:
-						setFastPlayLed(track);
-						if (stopImm_setting[track])
-							stopNow[track] = true;
-					break;
-
-					case RECORDING:
-						setFastRecLed(track);
-						if (!loopSync_setting[track])
-							stopNow[track] = true;
-					break;
-
-					case OVERDUBBING:
-						setFastOverdubLed(track);
-						if (stopImm_setting[track])
-							stopNow[track] = true;
-					break;
-				}
-				nextStatus[track] = IDLE;
-			}
-		}
+		if (allStop && globalStatus != IDLE)
+			stopAllTracks();
 
 		// ***************************************************************************************************************************
 		// **********************************************************************   T R A C K    M A N A G E M E N T   ***************
@@ -2467,14 +2476,14 @@ struct SickoLooper3 : Module {
 
 			volTrack[track] = params[VOLTRACK_KNOB_PARAM+track].getValue();
 
-			play_but[track] = params[PLAY_BUT_PARAM+track].getValue();
+			play_but[track] = params[PLAY_BUT_PARAM+track].getValue() || padButton == PLAY_BUT_PARAM+track;
 
-			rec_but[track] = params[REC_BUT_PARAM+track].getValue();
+			rec_but[track] = params[REC_BUT_PARAM+track].getValue() || padButton == REC_BUT_PARAM+track;
 
-			stop_but[track] = params[STOP_BUT_PARAM+track].getValue();
+			stop_but[track] = params[STOP_BUT_PARAM+track].getValue() || padButton == STOP_BUT_PARAM+track;
 			lights[STOP_BUT_LIGHT+track].setBrightness(stop_but[track]);
 
-			erase_but[track] = params[ERASE_BUT_PARAM+track].getValue();
+			erase_but[track] = params[ERASE_BUT_PARAM+track].getValue() || padButton == ERASE_BUT_PARAM+track;
 			lights[ERASE_BUT_LIGHT+track].setBrightness(erase_but[track]);	
 
 			loopSync_setting[track] = params[LOOPSYNC_SWITCH+track].getValue();
@@ -2563,22 +2572,21 @@ struct SickoLooper3 : Module {
 				if (trackStatus[track] == IDLE && eraseWait[track] && eraseTime[track] != eraseSamples) {
 					eraseWait[track] = false;
 
-// begin changes for metamodule
-//					trackBuffer[LEFT].resize(0);
-//					trackBuffer[RIGHT].resize(0);
-		 			vector<float>().swap(trackBuffer[track][LEFT]);
-		 			//trackBuffer[track][LEFT].reserve(0);
-		 			vector<float>().swap(trackBuffer[track][RIGHT]);
-		 			//trackBuffer[track][RIGHT].reserve(0);
-// end changes for metamodule
-
+					stopTrackTails(track);
+					if (nextStatus[track] != NOTHING) {
+						--busyTracks;
+						if (nextSoloTrack == track)
+							nextSoloTrack = -1;
+					}
+					vector<float>().swap(trackBuffer[track][LEFT]);
+					vector<float>().swap(trackBuffer[track][RIGHT]);
 					totalSamples[track] = 0;
 					totalSampleC[track] = 0;
 					trackStatus[track] = EMPTY;
 					nextStatus[track] = NOTHING;
 					trackRecorded[track] = false;
 					recordedTracks--;
-					lights[PLAY_BUT_LIGHT+track].setBrightness(0.f);
+					setEmptyLed(track);
 				}
 			}
 			
@@ -3387,7 +3395,7 @@ struct SickoLooper3 : Module {
 				// ************************************************ EXTERNAL CLOCK
 
 				// Reset
-				rstBarBut = params[CLOCK_RST_SWITCH].getValue();
+				rstBarBut = params[CLOCK_RST_SWITCH].getValue() || padButton == CLOCK_RST_SWITCH;
 				if (rstBarBut >= 1.f && prevRstBarBut < 1.f) {
 					beatCounter = currentBeatMaxPerBar;
 				}
@@ -4440,6 +4448,11 @@ struct SickoLooper3 : Module {
 				break;
 			}
 
+			if (extraPlaying[track] && playTail[track] && extraPlayPos[track] >= trackBuffer[track][LEFT].size()) {
+				extraPlaying[track] = false;
+				playTail[track] = false;
+				fadeTail[track] = false;
+			}
 			if (extraPlaying[track]) {
 
 				if (!playTail[track]) {
@@ -4491,7 +4504,8 @@ struct SickoLooper3 : Module {
 			if (extraRecording[track]) {
 				extraRecCount[track]++;
 
-				if (extraRecCount[track] > extraRecMaxSamples) {
+				if (extraRecCount[track] > extraRecMaxSamples ||
+				    extraRecPos[track] > trackBuffer[track][LEFT].size()) {
 					extraRecording[track] = false;
 
 				} else {
@@ -5711,6 +5725,16 @@ struct SickoLooper3Widget : ModuleWidget {
 			assert(module);
 
 		menu->addChild(new MenuSeparator());
+#ifndef METAMODULE
+		menu->addChild(createMenuLabel("GrooveBox pad · MIDI channel 16"));
+		menu->addChild(createSubmenuItem("Commands from pad", "", [=](Menu* submenu) {
+			looper3::portMenu(submenu, &module->groovebox.input);
+		}));
+		menu->addChild(createSubmenuItem("Feedback to pad", "", [=](Menu* submenu) {
+			looper3::portMenu(submenu, &module->groovebox.output);
+		}));
+		menu->addChild(new MenuSeparator());
+#endif
 		menu->addChild(createBoolPtrMenuItem("SOURCEs to MASTER out", "", &module->srcToMaster));
 		menu->addChild(createBoolPtrMenuItem("Only Click on EAR", "", &module->onlyClickOnEar));
 		menu->addChild(createBoolPtrMenuItem("EOL pulse on stop", "", &module->eolPulseOnStop));
